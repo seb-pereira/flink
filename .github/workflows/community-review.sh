@@ -28,6 +28,7 @@ REPO_OWNER=apache
 REPO_NAME=flink
 LGTM_LABEL="community-reviewed-LGTM"
 COMMUNITY_REVIEW_LABEL="community-reviewed"
+BACKPORT_LABEL_PREFIX="backport_"
 USER_CACHE_FILENAME="user_cache.txt"
 
 # =============================================================================
@@ -52,6 +53,7 @@ main() {
             node {
               number
               isDraft
+              baseRefName
               timelineItems(first: 100, itemTypes: [PULL_REQUEST_REVIEW]) {
                 nodes {
                   ... on PullRequestReview {
@@ -136,16 +138,19 @@ process_each_pr() {
   local token="${1?missing token}"
 
   # get pr numbers list
-  prNumbersAndPaging="$(jq -jr '.[] |  .node.number, "-",  .node.timelineItems.pageInfo.hasNextPage,"\n"' <<< "$pullRequests")"
+  prNumbersAndPaging="$(jq -jr '.[] |  .node.number, "-",  .node.timelineItems.pageInfo.hasNextPage, "\n"' <<< "$pullRequests")"
   prCount=$(wc -l <<< "$prNumbersAndPaging" | xargs)
   local counter=1
 
   # Process each pr separately in a loop
   while IFS= read -r line; do
-    local pr_number=${line%-*}
-    local hasNextPage=${line#*-}
+    local pr_number=${line%%-*}  # Extract PR number (everything before the first '-')
+    local hasNextPage=${line#*-}  # Extract hasNextPage (everything after the first '-')
 
-    printf "\n(%s/%s) PR %s - " "$counter" "$prCount" "$pr_number"
+    # Extract base branch for this PR to identify non-master target branches
+    local base_branch=$(jq --argjson number "$pr_number" -r '.[] | select(.node.number==$number) | .node.baseRefName' <<< "$pullRequests")
+    
+    printf "\n(%s/%s) PR %s - Base branch: %s - " "$counter" "$prCount" "$pr_number" "$base_branch"
 
     # find the node for our pr
     local pr_reviews
@@ -159,7 +164,7 @@ process_each_pr() {
 
     printf "Reviews %s Reviewers %s\n" "$(JSONArrayLength "$all_reviews")" "$(wc -l <<< "$pr_reviewers" | xargs)"
 
-    process_pr_reviews "$token" "$pr_number" "$pr_reviewers" || exit
+    process_pr_reviews "$token" "$pr_number" "$pr_reviewers" "$base_branch" || exit
     ((counter++))
   done <<< "$prNumbersAndPaging" || exit
 }
@@ -182,11 +187,13 @@ process_each_pr() {
 #   $1 - GitHub API token for authentication
 #   $2 - PR number
 #   $3 - PR reviews
+#   $4 - Base branch (target branch) of the PR
 # =============================================================================
 process_pr_reviews() {
   local token="${1?missing token}"
   local pr_number="${2?missing pr number}"
   local pr_reviews="${3?missing pr reviews}"
+  local base_branch="${4?missing base branch}"
 
   local communityApproves=0
   local requestForChanges=0
@@ -240,6 +247,35 @@ process_pr_reviews() {
       call_github_mutate_label_api "$token" "$label_to_delete" "DELETE" "$pr_number" || exit
       call_github_mutate_label_api "$token" "$label_to_post" "POST" "$pr_number" || exit
     fi
+  fi
+
+  # Handle backport label for non-master target branches
+  if [[ "$base_branch" != "master" ]]; then
+    local backport_label="${BACKPORT_LABEL_PREFIX}${base_branch}"
+    existing_labels=$(call_github_get_labels_api "$pr_number")
+    
+    # Check if the backport label already exists
+    if [[ ! "$existing_labels" =~ (^|[[:space:]])"$backport_label"($|[[:space:]]) ]]; then
+      echo "Setting backport label for non-master target branch: $base_branch"
+      call_github_mutate_label_api "$token" "$backport_label" "POST" "$pr_number" || exit
+    fi
+    
+    # Remove any other backport labels that might exist for other branches
+    for label in $existing_labels; do
+      if [[ "$label" =~ ^${BACKPORT_LABEL_PREFIX} && "$label" != "$backport_label" ]]; then
+        echo "Removing outdated backport label: $label"
+        call_github_mutate_label_api "$token" "$label" "DELETE" "$pr_number" || exit
+      fi
+    done
+  else
+    # If targeting master, remove any backport labels
+    existing_labels=$(call_github_get_labels_api "$pr_number")
+    for label in $existing_labels; do
+      if [[ "$label" =~ ^${BACKPORT_LABEL_PREFIX} ]]; then
+        echo "Removing backport label for master branch PR: $label"
+        call_github_mutate_label_api "$token" "$label" "DELETE" "$pr_number" || exit
+      fi
+    done
   fi
 }
 
